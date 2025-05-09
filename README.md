@@ -1,54 +1,66 @@
-# Haystack Agent with HTTP API via Hayhooks
+# Haystack Agent with OpenAI-Compatible API via Hayhooks
 
-This project demonstrates how to expose a Haystack Agent through HTTP endpoints using Hayhooks, allowing for both standard API calls and OpenAI-compatible streaming responses.
+This project demonstrates how to expose a Haystack Agent through an OpenAI-compatible API using Hayhooks.
 
 ## Components
 
-- **agent.py**: Contains the main implementation of a Haystack Agent with SerperDevWebSearch tool
 - **agent_deployment**: Directory containing deployment files for Hayhooks:
-  - **pipeline_wrapper.py**: Implementation of BasePipelineWrapper for standard API endpoints
-  - **model_wrapper.py**: Implementation for OpenAI-compatible API endpoints
+  - **pipeline_wrapper.py**: Implements the OpenAI-compatible API with both streaming and non-streaming support
 
 ## API Endpoints
 
-The agent is accessible through two types of API endpoints:
+The agent is accessible through an OpenAI-compatible chat completions API:
 
-### Standard API Endpoint
-
-```bash
-curl -X POST "http://localhost:1416/agent_service/run" \
-     -H "Content-Type: application/json" \
-     -d '{"query":"How is the weather in London?"}'
-```
-
-### OpenAI-compatible Streaming API Endpoint
+### Streaming Example
 
 ```bash
 curl -X POST "http://localhost:1416/v1/chat/completions" \
      -H "Content-Type: application/json" \
      -d '{
-       "model": "gpt-4o-mini",
-       "messages": [{"role": "user", "content": "How is the weather in London?"}],
-       "stream": true
+         "model": "gpt-4o-mini",
+         "messages": [{"role": "user", "content": "How is the weather in London?"}],
+         "stream": true
      }'
 ```
 
+### Non-Streaming Example
+
+```bash
+curl -X POST "http://localhost:1416/v1/chat/completions" \
+     -H "Content-Type: application/json" \
+     -d '{
+         "model": "gpt-4o-mini",
+         "messages": [{"role": "user", "content": "How is the weather in London?"}],
+         "stream": false
+     }'
+```
+
+## Setup and Usage
+
+1. Make sure you have Haystack and Hayhooks installed:
+   ```
+   pip install haystack-ai hayhooks
+   ```
+
+2. Run the start script to deploy the agent:
+   ```
+   ./start.sh
+   ```
+
+3. In a separate terminal, send requests to the API endpoint as shown above.
+
 ## Implementation Details
 
-1. **Standard Pipeline Wrapper**:
-   - Initializes a Haystack Agent with a web search tool
-   - Implements the `run_api` method for handling standard requests
-   - Returns text responses from the agent
+The implementation:
+- Uses Haystack's Agent with the SerperDevWebSearch tool
+- Exposes the agent through Hayhooks' OpenAI-compatible interface
+- Supports both streaming and non-streaming responses
+- Deploys the pipeline with name 'gpt-4o-mini' which is used as the model name in API requests
 
-2. **OpenAI-compatible API**:
-   - Uses the same agent pipeline
-   - Implements the `run_chat_completion` method required by Hayhooks
-   - Uses `streaming_generator` for streaming responses in OpenAI format
-   - Sets the `name` attribute to match the expected model name
+## Key Points
 
-## Key Lessons
-
-1. When implementing OpenAI compatibility, set the pipeline name to match the expected model name.
-2. Use `streaming_generator` for streaming responses.
-3. Implement both `run_api` and `run_chat_completion` methods for full compatibility.
-4. Hayhooks serves on a default port of 1416. 
+1. Hayhooks requires a file named `pipeline_wrapper.py` that implements the `BasePipelineWrapper` interface
+2. The pipeline name must match the model name in OpenAI API requests
+3. The wrapper class must implement `run_chat_completion` method for OpenAI compatibility
+4. Streaming responses are handled by the `streaming_generator` helper provided by Hayhooks
+5. Non-streaming responses are formatted to match the OpenAI API response format 
