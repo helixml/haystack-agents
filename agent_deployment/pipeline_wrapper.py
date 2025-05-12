@@ -5,14 +5,72 @@ from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.websearch import SerperDevWebSearch
 from haystack.tools.component_tool import ComponentTool
 from hayhooks import BasePipelineWrapper, get_last_user_message, streaming_generator
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterator, Union
 import time
 import logging
+import re
+import json
+from dataclasses import dataclass, field
+from threading import Lock
 
 # Set up logging with more detail
 logging.basicConfig(level=logging.DEBUG)
 # logging.basicConfig()
 logger = logging.getLogger(__name__)
+
+
+# Create a shared mutable class to pass information between Agent and streaming wrapper
+class SharedToolInfo:
+    def __init__(self):
+        self.lock = Lock()
+        self.pending_tool_calls = []
+        self.pending_tool_results = []
+        logger.debug("APPLE: SharedToolInfo initialized")
+        
+    def add_tool_call(self, tool_name, query):
+        with self.lock:
+            self.pending_tool_calls.append({
+                "tool_name": tool_name,
+                "query": query,
+                "inserted": False
+            })
+            logger.debug(f"APPLE: Added tool call to shared info: {tool_name}, query: {query}")
+            logger.debug(f"APPLE: Current pending tool calls: {len(self.pending_tool_calls)}")
+            
+    def add_tool_result(self, tool_name, result):
+        with self.lock:
+            self.pending_tool_results.append({
+                "tool_name": tool_name,
+                "result": result,
+                "inserted": False
+            })
+            logger.debug(f"APPLE: Added tool result to shared info: {tool_name}, result (truncated): {result[:100]}...")
+            logger.debug(f"APPLE: Current pending tool results: {len(self.pending_tool_results)}")
+            
+    def get_next_uninserted_tool_call(self):
+        with self.lock:
+            logger.debug(f"APPLE: Checking for uninserted tool calls, total: {len(self.pending_tool_calls)}")
+            for i, item in enumerate(self.pending_tool_calls):
+                if not item["inserted"]:
+                    item["inserted"] = True
+                    logger.debug(f"APPLE: Found uninserted tool call #{i}: {item['tool_name']}, query: {item['query']}")
+                    return item
+            logger.debug("APPLE: No uninserted tool calls found")
+            return None
+            
+    def get_next_uninserted_tool_result(self):
+        with self.lock:
+            logger.debug(f"APPLE: Checking for uninserted tool results, total: {len(self.pending_tool_results)}")
+            for i, item in enumerate(self.pending_tool_results):
+                if not item["inserted"]:
+                    item["inserted"] = True
+                    logger.debug(f"APPLE: Found uninserted tool result #{i}: {item['tool_name']}")
+                    return item
+            logger.debug("APPLE: No uninserted tool results found")
+            return None
+
+# Create a shared instance
+shared_tool_info = SharedToolInfo()
 
 
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
@@ -250,6 +308,7 @@ class Agent:
             The keys must match the schema defined in the Agent's `state_schema`.
         :return: Dictionary containing messages and outputs matching the defined output types
         """
+        logger.debug("Agent.run() method called")
         if not self._is_warmed_up and hasattr(self.chat_generator, "warm_up"):
             raise RuntimeError("The component Agent wasn't warmed up. Run 'warm_up()' before calling 'run()'.")
 
@@ -277,6 +336,34 @@ class Agent:
                     component_visits=component_visits,
                     parent_span=span,
                 )["replies"]
+                
+                # Log tool calls for debugging
+                for msg in llm_messages:
+                    if hasattr(msg, 'tool_call') and msg.tool_call:
+                        logger.debug(f"Tool call detected: {msg.tool_call}")
+                        # Write tool call to shared info for streaming
+                        if hasattr(msg.tool_call, 'tool_name') and msg.tool_call.tool_name:
+                            # Try to extract query from arguments or input
+                            query = ""
+                            if hasattr(msg.tool_call, 'arguments') and isinstance(msg.tool_call.arguments, dict) and 'query' in msg.tool_call.arguments:
+                                query = msg.tool_call.arguments['query']
+                            elif hasattr(msg.tool_call, 'input') and isinstance(msg.tool_call.input, dict) and 'query' in msg.tool_call.input:
+                                query = msg.tool_call.input['query']
+                            elif hasattr(msg.tool_call, 'arguments') and isinstance(msg.tool_call.arguments, str):
+                                try:
+                                    args = json.loads(msg.tool_call.arguments)
+                                    if isinstance(args, dict) and 'query' in args:
+                                        query = args['query']
+                                except:
+                                    pass
+                            
+                            # If we still don't have a query, use the tool name as fallback
+                            if not query:
+                                query = str(msg.tool_call.tool_name)
+                                
+                            logger.debug(f"FISH: Adding tool call to shared info: {msg.tool_call.tool_name}, {query}")
+                            shared_tool_info.add_tool_call(msg.tool_call.tool_name, query)
+                
                 state.set("messages", llm_messages)
 
                 # 2. Check if any of the LLM responses contain a tool call or if the LLM is not using tools
@@ -294,6 +381,25 @@ class Agent:
                     parent_span=span,
                 )
                 tool_messages = tool_invoker_result["tool_messages"]
+                
+                # Log tool results for debugging
+                for msg in tool_messages:
+                    if hasattr(msg, 'tool_call_result') and msg.tool_call_result:
+                        logger.debug(f"Tool result: {msg.tool_call_result}")
+                        # Write tool result to shared info for streaming
+                        if hasattr(msg.tool_call_result, 'origin') and hasattr(msg.tool_call_result.origin, 'tool_name'):
+                            tool_name = msg.tool_call_result.origin.tool_name
+                            result = ""
+                            if hasattr(msg.tool_call_result, 'data'):
+                                result = str(msg.tool_call_result.data)
+                            elif hasattr(msg.tool_call_result, 'result'):
+                                result = str(msg.tool_call_result.result)
+                            else:
+                                result = str(msg.tool_call_result)
+                                
+                            logger.debug(f"FISH: Adding tool result to shared info: {tool_name}, {result[:100]}...")
+                            shared_tool_info.add_tool_result(tool_name, result)
+                
                 state = tool_invoker_result["state"]
                 state.set("messages", tool_messages)
 
@@ -334,6 +440,7 @@ class Agent:
             The keys must match the schema defined in the Agent's `state_schema`.
         :return: Dictionary containing messages and outputs matching the defined output types
         """
+        logger.debug("FISH Agent.run_async() method called")
         if not self._is_warmed_up and hasattr(self.chat_generator, "warm_up"):
             raise RuntimeError("The component Agent wasn't warmed up. Run 'warm_up()' before calling 'run_async()'.")
 
@@ -439,6 +546,41 @@ class PipelineWrapper(BasePipelineWrapper):
     # Set name attribute to match expected model in requests
     name = "gpt-4o-mini"
     
+    # Add this function to help debug the streaming format
+    def _dump_openai_tool_example(self):
+        """
+        Create a sample of what we expect OpenAI tool calls to look like in the streaming format.
+        This is for debugging purposes.
+        """
+        example = {
+            "id": "chatcmpl-123",
+            "object": "chat.completion.chunk",
+            "created": 1694268190,
+            "model": "gpt-4o-mini",
+            "system_fingerprint": "fp_44709d6fcb",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_abc123",
+                                "type": "function",
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": "{\"query\":\"weather in London\"}"
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": None
+                }
+            ]
+        }
+        logger.debug(f"FISH EXAMPLE: Expected OpenAI format: {json.dumps(example, default=str)}")
+        return example
+    
     def setup(self) -> None:
         # Create the web search component
         logger.info("Setting up web search component...")
@@ -476,6 +618,101 @@ If you don't need to use a tool, just answer directly.""",
         self.pipeline = Pipeline()
         self.pipeline.add_component("agent", agent)
         logger.info("Pipeline setup complete!")
+        
+    def xml_streaming_wrapper(
+        self, 
+        original_generator: Iterator[Any]
+    ) -> Iterator[Any]:
+        """
+        Wraps the original streaming generator to inject XML tags for tool calls and results.
+        
+        Uses shared_tool_info to get tool calls and results from the Agent.run method.
+        Injects XML tags as soon as tool calls/results are detected, without waiting for content.
+        
+        This wrapper handles string chunks from the original generator.
+        """
+        logger.debug("APPLE STREAM: Starting XML streaming wrapper")
+        
+        # Track the current state
+        waiting_for_result = False
+        current_tool = None
+        injected_tool_call = False
+        injected_tool_result = False
+        
+        # For tracking progress
+        chunk_count = 0
+        first_chunk_logged = False
+        
+        # Reset shared info for this new run
+        shared_tool_info.pending_tool_calls = []
+        shared_tool_info.pending_tool_results = []
+        logger.debug("APPLE STREAM: Reset shared tool info")
+        
+        for chunk in original_generator:
+            chunk_count += 1
+            if not chunk:
+                logger.debug("APPLE STREAM: Empty chunk received")
+                continue
+            
+            # Log the original chunk format once
+            if not first_chunk_logged and chunk:
+                logger.debug(f"PEAR: ORIGINAL CHUNK FORMAT: {repr(chunk)}")
+                logger.debug(f"PEAR: ORIGINAL CHUNK TYPE: {type(chunk)}")
+                first_chunk_logged = True
+                
+            logger.debug(f"APPLE STREAM: Processing chunk #{chunk_count}")
+            
+            # STEP 1: Check for and inject any tool calls before sending content
+            tool_call_info = shared_tool_info.get_next_uninserted_tool_call()
+            if tool_call_info:
+                logger.debug(f"APPLE STREAM: Found new tool call to inject: {tool_call_info}")
+                waiting_for_result = True
+                current_tool = tool_call_info
+                injected_tool_call = True
+                
+                # Create the tool call XML
+                tool_name = tool_call_info["tool_name"]
+                query = tool_call_info["query"]
+                tool_call_xml = f"<tool_call name=\"{tool_name}\"><input>{query}</input></tool_call>\n"
+                
+                # Directly yield the XML string
+                logger.debug(f"PEAR: INJECTING TOOL CALL XML STRING: {repr(tool_call_xml)}")
+                logger.debug(f"APPLE STREAM: Injecting tool call XML: {tool_call_xml}")
+                yield tool_call_xml
+            
+            # STEP 2: Check for and inject any tool results
+            if waiting_for_result:
+                tool_result_info = shared_tool_info.get_next_uninserted_tool_result()
+                if tool_result_info:
+                    logger.debug(f"APPLE STREAM: Found new tool result to inject: {tool_result_info}")
+                    waiting_for_result = False
+                    injected_tool_result = True
+                    
+                    # Create the tool result XML
+                    tool_name = tool_result_info["tool_name"]
+                    result = tool_result_info["result"]
+                    tool_result_xml = f"<tool_result name=\"{tool_name}\"><output>{result}</output></tool_result>\n"
+                    
+                    # Directly yield the XML string
+                    logger.debug(f"PEAR: INJECTING TOOL RESULT XML STRING: {repr(tool_result_xml[:100])}...")
+                    logger.debug(f"APPLE STREAM: Injecting tool result XML: {tool_result_xml[:100]}...")
+                    yield tool_result_xml
+            
+            # STEP 3: Now it's safe to pass through the original chunk
+            logger.debug(f"APPLE STREAM: Passing through original chunk {chunk_count}: {repr(chunk[:50])}...")
+            
+            # For string chunks, log the content directly
+            if isinstance(chunk, str) and chunk.strip():
+                logger.debug(f"PEAR: CONTENT IN CHUNK #{chunk_count}: {repr(chunk[:50])}...")
+            
+            yield chunk
+            
+        # Final logging to check if we injected XML as expected
+        logger.debug(f"APPLE STREAM: Streaming complete. Injected tool call: {injected_tool_call}, Injected tool result: {injected_tool_result}")
+        if not injected_tool_call:
+            logger.debug("APPLE STREAM: WARNING - No tool call XML was injected during streaming!")
+        if not injected_tool_result:
+            logger.debug("APPLE STREAM: WARNING - No tool result XML was injected during streaming!")
 
     def run_api(self, query: str) -> str:
         """
@@ -512,25 +749,143 @@ If you don't need to use a tool, just answer directly.""",
         
         if stream:
             # Stream the response to the client
-            logger.info("Using streaming response")
-            return streaming_generator(
+            logger.info("Using streaming response with XML tags")
+            # Output an example of what we expect for debugging
+            self._dump_openai_tool_example()
+            original_stream = streaming_generator(
                 pipeline=self.pipeline, 
                 pipeline_run_args={"agent": {"messages": [user_message]}}
             )
+            return self.xml_streaming_wrapper(original_stream)
         else:
             # Return a complete response without streaming
             logger.info("Using non-streaming response")
             result = self.pipeline.run({"agent": {"messages": [user_message]}})
-            response_text = result["agent"]["messages"][-1].text
+            
+            # Begin constructing the full response with tool calls and results
+            full_response = ""
+            tool_call_found = False
+            tool_result_found = False
             
             # Log the complete conversation history
             logger.info("Complete conversation history:")
-            for msg in result["agent"]["messages"]:
-                logger.info(f"{msg.role}: {msg.text}")
+            for idx, msg in enumerate(result["agent"]["messages"]):
+                logger.info(f"Message #{idx} role: {msg.role}, text: {msg.text}")
+                logger.info(f"FISH: Message #{idx} dir(msg): {dir(msg)}")
+                logger.info(f"FISH: Message #{idx} type: {type(msg)}")
+                
+                # Let's find all attributes with values
+                for attr in dir(msg):
+                    if not attr.startswith('_') and not callable(getattr(msg, attr)):
+                        try:
+                            value = getattr(msg, attr)
+                            logger.info(f"FISH: Message #{idx} {attr} = {value}")
+                        except Exception as e:
+                            logger.info(f"FISH: Error getting {attr}: {e}")
+                
+                # Process tool calls
                 if hasattr(msg, 'tool_call') and msg.tool_call:
-                    logger.info(f"Tool call: {msg.tool_call}")
+                    logger.info(f"FISH: Tool call object: {msg.tool_call}")
+                    logger.info(f"FISH: Tool call type: {type(msg.tool_call)}")
+                    logger.info(f"FISH: Tool call dir: {dir(msg.tool_call)}")
+                    
+                    # ToolCall is an object, not a dictionary, so access its properties directly
+                    tool_name = msg.tool_call.tool_name if hasattr(msg.tool_call, 'tool_name') else "unknown_tool"
+                    logger.info(f"FISH: Extracted tool name: {tool_name}")
+                    
+                    # The input structure depends on the tool implementation
+                    try:
+                        # Try accessing as an attribute first
+                        if hasattr(msg.tool_call, 'input') and isinstance(msg.tool_call.input, dict):
+                            tool_input = msg.tool_call.input
+                            logger.info(f"FISH: Found tool input as dict attribute: {tool_input}")
+                        # Try the arguments attribute which is already a dictionary in our case
+                        elif hasattr(msg.tool_call, 'arguments') and isinstance(msg.tool_call.arguments, dict):
+                            tool_input = msg.tool_call.arguments
+                            logger.info(f"FISH: Found arguments as dict: {tool_input}")
+                        # If it's a string, try parsing it as JSON
+                        elif hasattr(msg.tool_call, 'arguments') and isinstance(msg.tool_call.arguments, str):
+                            logger.info(f"FISH: Found arguments as string, parsing as JSON: {msg.tool_call.arguments}")
+                            try:
+                                tool_input = json.loads(msg.tool_call.arguments)
+                                logger.info(f"FISH: Parsed arguments as JSON: {tool_input}")
+                            except json.JSONDecodeError:
+                                logger.info(f"FISH: Failed to parse arguments as JSON")
+                                # Just use the user's question as the fallback
+                                tool_input = {"query": question}
+                                logger.info(f"FISH: Using user question as fallback: {question}")
+                        # If none of those work, try direct access
+                        elif hasattr(msg.tool_call, 'query'):
+                            logger.info(f"FISH: Found query attribute: {msg.tool_call.query}")
+                            tool_input = {"query": msg.tool_call.query}
+                        else:
+                            # If we can't find a query, use the raw properties
+                            logger.info(f"FISH: No standard query attribute found, using str(msg.tool_call)")
+                            tool_input = {"query": str(msg.tool_call)}
+                    except Exception as e:
+                        logger.error(f"FISH: Error extracting tool input: {e}")
+                        # Just use the user's question as the fallback
+                        tool_input = {"query": question}
+                        logger.info(f"FISH: Using user question as fallback: {question}")
+                    
+                    # Check if we have a query to use
+                    if isinstance(tool_input, dict) and "query" in tool_input:
+                        query_value = tool_input["query"]
+                        logger.info(f"FISH: Found query in tool_input: {query_value}")
+                    else:
+                        # Default to the user's question if we can't find a specific query
+                        query_value = question
+                        logger.info(f"FISH: Using original question as query: {query_value}")
+                    
+                    tool_call_found = True
+                    full_response += f"<tool_call name=\"{tool_name}\"><input>{query_value}</input></tool_call>\n"
+                    
+                    # If this is the web_search tool, do some extra debug
+                    if tool_name == "web_search":
+                        logger.info(f"FISH: Special web_search debug:")
+                        logger.info(f"FISH: Original question: {question}")
+                        logger.info(f"FISH: Final query_value used: {query_value}")
+                        # Try to extract the input in different ways
+                        if hasattr(msg.tool_call, 'function'):
+                            logger.info(f"FISH: web_search has function attribute: {msg.tool_call.function}")
+                            if hasattr(msg.tool_call.function, 'arguments'):
+                                logger.info(f"FISH: web_search function arguments: {msg.tool_call.function.arguments}")
+                        if hasattr(msg.tool_call, 'params'):
+                            logger.info(f"FISH: web_search has params: {msg.tool_call.params}")
+                        if hasattr(msg.tool_call, 'input'):
+                            logger.info(f"FISH: web_search has input: {msg.tool_call.input}")
+                        logger.info(f"FISH: web_search tool_call str: {str(msg.tool_call)}")
+                
+                # Process tool results
                 if hasattr(msg, 'tool_call_result') and msg.tool_call_result:
                     logger.info(f"Tool result: {msg.tool_call_result}")
+                    tool_name = "unknown_tool"
+                    result_value = ""
+                    
+                    # Extract tool name and result safely
+                    if hasattr(msg.tool_call_result, 'origin') and hasattr(msg.tool_call_result.origin, 'tool_name'):
+                        tool_name = msg.tool_call_result.origin.tool_name
+                    
+                    # Get result data
+                    if hasattr(msg.tool_call_result, 'data'):
+                        result_value = str(msg.tool_call_result.data)
+                    elif hasattr(msg.tool_call_result, 'result'):
+                        result_value = str(msg.tool_call_result.result)
+                    else:
+                        result_value = str(msg.tool_call_result)
+                    
+                    tool_result_found = True
+                    full_response += f"<tool_result name=\"{tool_name}\"><output>{result_value}</output></tool_result>\n"
             
-            logger.info(f"Final response text: {response_text}")
-            return response_text 
+            # If we didn't find explicit tool calls/results but this is clearly a tool-using interaction,
+            # try to extract them from the final text response
+            if not (tool_call_found and tool_result_found) and result["agent"]["messages"][-1].text:
+                # Just use the final text response without trying to guess about tools
+                full_response = result["agent"]["messages"][-1].text
+            else:
+                # Add the final response text if present
+                if result["agent"]["messages"][-1].role == "assistant" and result["agent"]["messages"][-1].text:
+                    full_response += result["agent"]["messages"][-1].text
+            
+            logger.info(f"Final response with XML tags: {full_response}")
+            return full_response.strip() 
