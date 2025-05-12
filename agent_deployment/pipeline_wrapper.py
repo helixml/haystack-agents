@@ -12,6 +12,8 @@ import re
 import json
 from dataclasses import dataclass, field
 from threading import Lock
+import queue
+import threading
 
 # Set up logging with more detail
 logging.basicConfig(level=logging.DEBUG)
@@ -25,27 +27,43 @@ class SharedToolInfo:
         self.lock = Lock()
         self.pending_tool_calls = []
         self.pending_tool_results = []
+        # Create a queue for the merged output stream
+        self.output_queue = queue.Queue()
+        # Flag to signal when the original generator is done
+        self.generator_done = threading.Event()
         logger.debug("APPLE: SharedToolInfo initialized")
         
     def add_tool_call(self, tool_name, query):
         with self.lock:
-            self.pending_tool_calls.append({
+            tool_call_info = {
                 "tool_name": tool_name,
                 "query": query,
                 "inserted": False
-            })
+            }
+            self.pending_tool_calls.append(tool_call_info)
             logger.debug(f"APPLE: Added tool call to shared info: {tool_name}, query: {query}")
             logger.debug(f"APPLE: Current pending tool calls: {len(self.pending_tool_calls)}")
             
+            # Directly put tool call XML into the output queue
+            xml = f"<tool_call name=\"{tool_name}\"><input>{query}</input></tool_call>\n"
+            self.output_queue.put(xml)
+            logger.debug(f"APPLE: Directly added tool call XML to output queue")
+            
     def add_tool_result(self, tool_name, result):
         with self.lock:
-            self.pending_tool_results.append({
+            tool_result_info = {
                 "tool_name": tool_name,
                 "result": result,
                 "inserted": False
-            })
+            }
+            self.pending_tool_results.append(tool_result_info)
             logger.debug(f"APPLE: Added tool result to shared info: {tool_name}, result (truncated): {result[:100]}...")
             logger.debug(f"APPLE: Current pending tool results: {len(self.pending_tool_results)}")
+            
+            # Directly put tool result XML into the output queue
+            xml = f"<tool_result name=\"{tool_name}\"><output>{result}</output></tool_result>\n"
+            self.output_queue.put(xml)
+            logger.debug(f"APPLE: Directly added tool result XML to output queue")
             
     def get_next_uninserted_tool_call(self):
         with self.lock:
@@ -68,6 +86,21 @@ class SharedToolInfo:
                     return item
             logger.debug("APPLE: No uninserted tool results found")
             return None
+    
+    def reset(self):
+        """Reset the state for a new streaming session"""
+        with self.lock:
+            self.pending_tool_calls = []
+            self.pending_tool_results = []
+            # Clear any items in the output queue
+            while not self.output_queue.empty():
+                try:
+                    self.output_queue.get_nowait()
+                except queue.Empty:
+                    break
+            # Reset the done flag
+            self.generator_done.clear()
+            logger.debug("APPLE: SharedToolInfo reset for new streaming session")
 
 # Create a shared instance
 shared_tool_info = SharedToolInfo()
@@ -626,93 +659,73 @@ If you don't need to use a tool, just answer directly.""",
         """
         Wraps the original streaming generator to inject XML tags for tool calls and results.
         
-        Uses shared_tool_info to get tool calls and results from the Agent.run method.
-        Injects XML tags as soon as tool calls/results are detected, without waiting for content.
+        Uses a true interleaving approach with a background thread that processes the
+        original LLM stream while tool calls and results are added directly to the output
+        queue from their respective threads.
         
-        This wrapper handles string chunks from the original generator.
+        This provides immediate feedback to the user when tools are called without any
+        dependency on the timing of the LLM's responses.
         """
         logger.debug("APPLE STREAM: Starting XML streaming wrapper")
         
-        # Track the current state
-        waiting_for_result = False
-        current_tool = None
-        injected_tool_call = False
-        injected_tool_result = False
-        
-        # For tracking progress
-        chunk_count = 0
-        first_chunk_logged = False
-        
         # Reset shared info for this new run
-        shared_tool_info.pending_tool_calls = []
-        shared_tool_info.pending_tool_results = []
+        shared_tool_info.reset()
         logger.debug("APPLE STREAM: Reset shared tool info")
         
-        for chunk in original_generator:
-            chunk_count += 1
-            if not chunk:
-                logger.debug("APPLE STREAM: Empty chunk received")
+        # Function for background thread to process original generator
+        def process_original_generator():
+            try:
+                chunk_count = 0
+                first_chunk_logged = False
+                
+                for chunk in original_generator:
+                    chunk_count += 1
+                    
+                    # Skip empty chunks
+                    if not chunk:
+                        logger.debug("APPLE STREAM: Empty chunk received")
+                        continue
+                    
+                    # Log the original chunk format once
+                    if not first_chunk_logged and chunk:
+                        logger.debug(f"PEAR: ORIGINAL CHUNK FORMAT: {repr(chunk)}")
+                        logger.debug(f"PEAR: ORIGINAL CHUNK TYPE: {type(chunk)}")
+                        first_chunk_logged = True
+                    
+                    # Log and put the chunk in the output queue
+                    logger.debug(f"APPLE STREAM: Putting original chunk {chunk_count} in output queue: {repr(chunk[:50])}...")
+                    if isinstance(chunk, str) and chunk.strip():
+                        logger.debug(f"PEAR: CONTENT IN CHUNK #{chunk_count}: {repr(chunk[:50])}...")
+                    
+                    # Put the chunk in the shared output queue
+                    shared_tool_info.output_queue.put(chunk)
+                
+                logger.debug("APPLE STREAM: Original generator completed")
+            except Exception as e:
+                logger.error(f"APPLE STREAM: Error processing original generator: {e}")
+            finally:
+                # Signal that the generator is done
+                shared_tool_info.generator_done.set()
+                logger.debug("APPLE STREAM: Set generator_done flag")
+        
+        # Start the background thread to process the original generator
+        thread = threading.Thread(target=process_original_generator)
+        thread.daemon = True
+        thread.start()
+        logger.debug("APPLE STREAM: Started background thread for original generator")
+        
+        # Yield from the shared output queue until both sources are done
+        while not shared_tool_info.generator_done.is_set() or not shared_tool_info.output_queue.empty():
+            try:
+                # Get with a timeout to allow checking if we're done
+                item = shared_tool_info.output_queue.get(timeout=0.1)
+                logger.debug(f"APPLE STREAM: Yielding from output queue: {repr(item[:50] if isinstance(item, str) else item)[:100]}...")
+                yield item
+            except queue.Empty:
+                # Queue is empty but generator might not be done
                 continue
-            
-            # Log the original chunk format once
-            if not first_chunk_logged and chunk:
-                logger.debug(f"PEAR: ORIGINAL CHUNK FORMAT: {repr(chunk)}")
-                logger.debug(f"PEAR: ORIGINAL CHUNK TYPE: {type(chunk)}")
-                first_chunk_logged = True
-                
-            logger.debug(f"APPLE STREAM: Processing chunk #{chunk_count}")
-            
-            # STEP 1: Check for and inject any tool calls before sending content
-            tool_call_info = shared_tool_info.get_next_uninserted_tool_call()
-            if tool_call_info:
-                logger.debug(f"APPLE STREAM: Found new tool call to inject: {tool_call_info}")
-                waiting_for_result = True
-                current_tool = tool_call_info
-                injected_tool_call = True
-                
-                # Create the tool call XML
-                tool_name = tool_call_info["tool_name"]
-                query = tool_call_info["query"]
-                tool_call_xml = f"<tool_call name=\"{tool_name}\"><input>{query}</input></tool_call>\n"
-                
-                # Directly yield the XML string
-                logger.debug(f"PEAR: INJECTING TOOL CALL XML STRING: {repr(tool_call_xml)}")
-                logger.debug(f"APPLE STREAM: Injecting tool call XML: {tool_call_xml}")
-                yield tool_call_xml
-            
-            # STEP 2: Check for and inject any tool results
-            if waiting_for_result:
-                tool_result_info = shared_tool_info.get_next_uninserted_tool_result()
-                if tool_result_info:
-                    logger.debug(f"APPLE STREAM: Found new tool result to inject: {tool_result_info}")
-                    waiting_for_result = False
-                    injected_tool_result = True
-                    
-                    # Create the tool result XML
-                    tool_name = tool_result_info["tool_name"]
-                    result = tool_result_info["result"]
-                    tool_result_xml = f"<tool_result name=\"{tool_name}\"><output>{result}</output></tool_result>\n"
-                    
-                    # Directly yield the XML string
-                    logger.debug(f"PEAR: INJECTING TOOL RESULT XML STRING: {repr(tool_result_xml[:100])}...")
-                    logger.debug(f"APPLE STREAM: Injecting tool result XML: {tool_result_xml[:100]}...")
-                    yield tool_result_xml
-            
-            # STEP 3: Now it's safe to pass through the original chunk
-            logger.debug(f"APPLE STREAM: Passing through original chunk {chunk_count}: {repr(chunk[:50])}...")
-            
-            # For string chunks, log the content directly
-            if isinstance(chunk, str) and chunk.strip():
-                logger.debug(f"PEAR: CONTENT IN CHUNK #{chunk_count}: {repr(chunk[:50])}...")
-            
-            yield chunk
-            
-        # Final logging to check if we injected XML as expected
-        logger.debug(f"APPLE STREAM: Streaming complete. Injected tool call: {injected_tool_call}, Injected tool result: {injected_tool_result}")
-        if not injected_tool_call:
-            logger.debug("APPLE STREAM: WARNING - No tool call XML was injected during streaming!")
-        if not injected_tool_result:
-            logger.debug("APPLE STREAM: WARNING - No tool result XML was injected during streaming!")
+        
+        logger.debug("APPLE STREAM: Streaming complete")
 
     def run_api(self, query: str) -> str:
         """
