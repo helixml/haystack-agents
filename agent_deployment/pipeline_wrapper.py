@@ -1,6 +1,6 @@
 from haystack import Pipeline
 from haystack.dataclasses import ChatMessage
-from haystack.components.agents import Agent
+# from haystack.components.agents import Agent
 from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.websearch import SerperDevWebSearch
 from haystack.tools.component_tool import ComponentTool
@@ -10,9 +10,430 @@ import time
 import logging
 
 # Set up logging with more detail
-# logging.basicConfig(level=logging.DEBUG)
-logging.basicConfig()
+logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig()
 logger = logging.getLogger(__name__)
+
+
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import inspect
+from typing import Any, Dict, List, Optional, Union
+
+from haystack import component, default_from_dict, default_to_dict, logging, tracing
+from haystack.components.generators.chat.types import ChatGenerator
+from haystack.components.tools import ToolInvoker
+from haystack.core.pipeline.async_pipeline import AsyncPipeline
+from haystack.core.pipeline.pipeline import Pipeline
+from haystack.core.pipeline.utils import _deepcopy_with_exceptions
+from haystack.core.serialization import component_to_dict
+from haystack.dataclasses import ChatMessage
+from haystack.dataclasses.state import State, _schema_from_dict, _schema_to_dict, _validate_schema
+from haystack.dataclasses.state_utils import merge_lists
+from haystack.dataclasses.streaming_chunk import StreamingCallbackT
+from haystack.tools import Tool, Toolset, deserialize_tools_or_toolset_inplace, serialize_tools_or_toolset
+from haystack.utils.callable_serialization import deserialize_callable, serialize_callable
+from haystack.utils.deserialization import deserialize_chatgenerator_inplace
+
+logger = logging.getLogger(__name__)
+
+
+@component
+class Agent:
+    """
+    A Haystack component that implements a tool-using agent with provider-agnostic chat model support.
+
+    The component processes messages and executes tools until a exit_condition condition is met.
+    The exit_condition can be triggered either by a direct text response or by invoking a specific designated tool.
+
+    When you call an Agent without tools, it acts as a ChatGenerator, produces one response, then exits.
+
+    ### Usage example
+    ```python
+    from haystack.components.agents import Agent
+    from haystack.components.generators.chat import OpenAIChatGenerator
+    from haystack.dataclasses import ChatMessage
+    from haystack.tools.tool import Tool
+
+    tools = [Tool(name="calculator", description="..."), Tool(name="search", description="...")]
+
+    agent = Agent(
+        chat_generator=OpenAIChatGenerator(),
+        tools=tools,
+        exit_condition="search",
+    )
+
+    # Run the agent
+    result = agent.run(
+        messages=[ChatMessage.from_user("Find information about Haystack")]
+    )
+
+    assert "messages" in result  # Contains conversation history
+    ```
+    """
+
+    def __init__(
+        self,
+        *,
+        chat_generator: ChatGenerator,
+        tools: Optional[Union[List[Tool], Toolset]] = None,
+        system_prompt: Optional[str] = None,
+        exit_conditions: Optional[List[str]] = None,
+        state_schema: Optional[Dict[str, Any]] = None,
+        max_agent_steps: int = 100,
+        raise_on_tool_invocation_failure: bool = False,
+        streaming_callback: Optional[StreamingCallbackT] = None,
+    ):
+        """
+        Initialize the agent component.
+
+        :param chat_generator: An instance of the chat generator that your agent should use. It must support tools.
+        :param tools: List of Tool objects or a Toolset that the agent can use.
+        :param system_prompt: System prompt for the agent.
+        :param exit_conditions: List of conditions that will cause the agent to return.
+            Can include "text" if the agent should return when it generates a message without tool calls,
+            or tool names that will cause the agent to return once the tool was executed. Defaults to ["text"].
+        :param state_schema: The schema for the runtime state used by the tools.
+        :param max_agent_steps: Maximum number of steps the agent will run before stopping. Defaults to 100.
+            If the agent exceeds this number of steps, it will stop and return the current state.
+        :param raise_on_tool_invocation_failure: Should the agent raise an exception when a tool invocation fails?
+            If set to False, the exception will be turned into a chat message and passed to the LLM.
+        :param streaming_callback: A callback that will be invoked when a response is streamed from the LLM.
+        :raises TypeError: If the chat_generator does not support tools parameter in its run method.
+        """
+        # Check if chat_generator supports tools parameter
+        chat_generator_run_method = inspect.signature(chat_generator.run)
+        if "tools" not in chat_generator_run_method.parameters:
+            raise TypeError(
+                f"{type(chat_generator).__name__} does not accept tools parameter in its run method. "
+                "The Agent component requires a chat generator that supports tools."
+            )
+
+        valid_exits = ["text"] + [tool.name for tool in tools or []]
+        if exit_conditions is None:
+            exit_conditions = ["text"]
+        if not all(condition in valid_exits for condition in exit_conditions):
+            raise ValueError(
+                f"Invalid exit conditions provided: {exit_conditions}. "
+                f"Valid exit conditions must be a subset of {valid_exits}. "
+                "Ensure that each exit condition corresponds to either 'text' or a valid tool name."
+            )
+
+        # Validate state schema if provided
+        if state_schema is not None:
+            _validate_schema(state_schema)
+        self._state_schema = state_schema or {}
+
+        # Initialize state schema
+        resolved_state_schema = _deepcopy_with_exceptions(self._state_schema)
+        if resolved_state_schema.get("messages") is None:
+            resolved_state_schema["messages"] = {"type": List[ChatMessage], "handler": merge_lists}
+        self.state_schema = resolved_state_schema
+
+        self.chat_generator = chat_generator
+        self.tools = tools or []
+        self.system_prompt = system_prompt
+        self.exit_conditions = exit_conditions
+        self.max_agent_steps = max_agent_steps
+        self.raise_on_tool_invocation_failure = raise_on_tool_invocation_failure
+        self.streaming_callback = streaming_callback
+
+        output_types = {}
+        for param, config in self.state_schema.items():
+            output_types[param] = config["type"]
+            # Skip setting input types for parameters that are already in the run method
+            if param in ["messages", "streaming_callback"]:
+                continue
+            component.set_input_type(self, name=param, type=config["type"], default=None)
+        component.set_output_types(self, **output_types)
+
+        self._tool_invoker = None
+        if self.tools:
+            self._tool_invoker = ToolInvoker(tools=self.tools, raise_on_failure=self.raise_on_tool_invocation_failure)
+        else:
+            logger.warning(
+                "No tools provided to the Agent. The Agent will behave like a ChatGenerator and only return text "
+                "responses. To enable tool usage, pass tools directly to the Agent, not to the chat_generator."
+            )
+
+        self._is_warmed_up = False
+
+    def warm_up(self) -> None:
+        """
+        Warm up the Agent.
+        """
+        if not self._is_warmed_up:
+            if hasattr(self.chat_generator, "warm_up"):
+                self.chat_generator.warm_up()
+            self._is_warmed_up = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize the component to a dictionary.
+
+        :return: Dictionary with serialized data
+        """
+        if self.streaming_callback is not None:
+            streaming_callback = serialize_callable(self.streaming_callback)
+        else:
+            streaming_callback = None
+
+        return default_to_dict(
+            self,
+            chat_generator=component_to_dict(obj=self.chat_generator, name="chat_generator"),
+            tools=serialize_tools_or_toolset(self.tools),
+            system_prompt=self.system_prompt,
+            exit_conditions=self.exit_conditions,
+            # We serialize the original state schema, not the resolved one to reflect the original user input
+            state_schema=_schema_to_dict(self._state_schema),
+            max_agent_steps=self.max_agent_steps,
+            raise_on_tool_invocation_failure=self.raise_on_tool_invocation_failure,
+            streaming_callback=streaming_callback,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Agent":
+        """
+        Deserialize the agent from a dictionary.
+
+        :param data: Dictionary to deserialize from
+        :return: Deserialized agent
+        """
+        init_params = data.get("init_parameters", {})
+
+        deserialize_chatgenerator_inplace(init_params, key="chat_generator")
+
+        if "state_schema" in init_params:
+            init_params["state_schema"] = _schema_from_dict(init_params["state_schema"])
+
+        if init_params.get("streaming_callback") is not None:
+            init_params["streaming_callback"] = deserialize_callable(init_params["streaming_callback"])
+
+        deserialize_tools_or_toolset_inplace(init_params, key="tools")
+
+        return default_from_dict(cls, data)
+
+    def _prepare_generator_inputs(self, streaming_callback: Optional[StreamingCallbackT] = None) -> Dict[str, Any]:
+        """Prepare inputs for the chat generator."""
+        generator_inputs: Dict[str, Any] = {"tools": self.tools}
+        selected_callback = streaming_callback or self.streaming_callback
+        if selected_callback is not None:
+            generator_inputs["streaming_callback"] = selected_callback
+        return generator_inputs
+
+    def _create_agent_span(self) -> Any:
+        """Create a span for the agent run."""
+        return tracing.tracer.trace(
+            "haystack.agent.run",
+            tags={
+                "haystack.agent.max_steps": self.max_agent_steps,
+                "haystack.agent.tools": self.tools,
+                "haystack.agent.exit_conditions": self.exit_conditions,
+                "haystack.agent.state_schema": _schema_to_dict(self.state_schema),
+            },
+        )
+
+    def run(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        **kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Process messages and execute tools until the exit condition is met.
+
+        :param messages: List of chat messages to process
+        :param streaming_callback: A callback that will be invoked when a response is streamed from the LLM.
+        :param kwargs: Additional data to pass to the State schema used by the Agent.
+            The keys must match the schema defined in the Agent's `state_schema`.
+        :return: Dictionary containing messages and outputs matching the defined output types
+        """
+        if not self._is_warmed_up and hasattr(self.chat_generator, "warm_up"):
+            raise RuntimeError("The component Agent wasn't warmed up. Run 'warm_up()' before calling 'run()'.")
+
+        if self.system_prompt is not None:
+            messages = [ChatMessage.from_system(self.system_prompt)] + messages
+
+        state = State(schema=self.state_schema, data=kwargs)
+        state.set("messages", messages)
+
+        generator_inputs = self._prepare_generator_inputs(streaming_callback=streaming_callback)
+
+        component_visits = dict.fromkeys(["chat_generator", "tool_invoker"], 0)
+        with self._create_agent_span() as span:
+            span.set_content_tag(
+                "haystack.agent.input",
+                _deepcopy_with_exceptions({"messages": messages, "streaming_callback": streaming_callback, **kwargs}),
+            )
+            counter = 0
+            while counter < self.max_agent_steps:
+                # 1. Call the ChatGenerator
+                llm_messages = Pipeline._run_component(
+                    component_name="chat_generator",
+                    component={"instance": self.chat_generator},
+                    inputs={"messages": messages, **generator_inputs},
+                    component_visits=component_visits,
+                    parent_span=span,
+                )["replies"]
+                state.set("messages", llm_messages)
+
+                # 2. Check if any of the LLM responses contain a tool call or if the LLM is not using tools
+                if not any(msg.tool_call for msg in llm_messages) or self._tool_invoker is None:
+                    counter += 1
+                    break
+
+                # 3. Call the ToolInvoker
+                # We only send the messages from the LLM to the tool invoker
+                tool_invoker_result = Pipeline._run_component(
+                    component_name="tool_invoker",
+                    component={"instance": self._tool_invoker},
+                    inputs={"messages": llm_messages, "state": state},
+                    component_visits=component_visits,
+                    parent_span=span,
+                )
+                tool_messages = tool_invoker_result["tool_messages"]
+                state = tool_invoker_result["state"]
+                state.set("messages", tool_messages)
+
+                # 4. Check if any LLM message's tool call name matches an exit condition
+                if self.exit_conditions != ["text"] and self._check_exit_conditions(llm_messages, tool_messages):
+                    counter += 1
+                    break
+
+                # 5. Fetch the combined messages and send them back to the LLM
+                messages = state.get("messages")
+                counter += 1
+
+            if counter >= self.max_agent_steps:
+                logger.warning(
+                    "Agent reached maximum agent steps of {max_agent_steps}, stopping.",
+                    max_agent_steps=self.max_agent_steps,
+                )
+            span.set_content_tag("haystack.agent.output", state.data)
+            span.set_tag("haystack.agent.steps_taken", counter)
+        return state.data
+
+    async def run_async(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[StreamingCallbackT] = None,
+        **kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Asynchronously process messages and execute tools until the exit condition is met.
+
+        This is the asynchronous version of the `run` method. It follows the same logic but uses
+        asynchronous operations where possible, such as calling the `run_async` method of the ChatGenerator
+        if available.
+
+        :param messages: List of chat messages to process
+        :param streaming_callback: A callback that will be invoked when a response is streamed from the LLM.
+        :param kwargs: Additional data to pass to the State schema used by the Agent.
+            The keys must match the schema defined in the Agent's `state_schema`.
+        :return: Dictionary containing messages and outputs matching the defined output types
+        """
+        if not self._is_warmed_up and hasattr(self.chat_generator, "warm_up"):
+            raise RuntimeError("The component Agent wasn't warmed up. Run 'warm_up()' before calling 'run_async()'.")
+
+        if self.system_prompt is not None:
+            messages = [ChatMessage.from_system(self.system_prompt)] + messages
+
+        state = State(schema=self.state_schema, data=kwargs)
+        state.set("messages", messages)
+
+        generator_inputs = self._prepare_generator_inputs(streaming_callback=streaming_callback)
+
+        component_visits = dict.fromkeys(["chat_generator", "tool_invoker"], 0)
+        with self._create_agent_span() as span:
+            span.set_content_tag(
+                "haystack.agent.input",
+                _deepcopy_with_exceptions({"messages": messages, "streaming_callback": streaming_callback, **kwargs}),
+            )
+            counter = 0
+            while counter < self.max_agent_steps:
+                # 1. Call the ChatGenerator
+                result = await AsyncPipeline._run_component_async(
+                    component_name="chat_generator",
+                    component={"instance": self.chat_generator},
+                    component_inputs={"messages": messages, **generator_inputs},
+                    component_visits=component_visits,
+                    max_runs_per_component=self.max_agent_steps,
+                    parent_span=span,
+                )
+                llm_messages = result["replies"]
+                state.set("messages", llm_messages)
+
+                # 2. Check if any of the LLM responses contain a tool call or if the LLM is not using tools
+                if not any(msg.tool_call for msg in llm_messages) or self._tool_invoker is None:
+                    counter += 1
+                    break
+
+                # 3. Call the ToolInvoker
+                # We only send the messages from the LLM to the tool invoker
+                # Check if the ToolInvoker supports async execution. Currently, it doesn't.
+                tool_invoker_result = await AsyncPipeline._run_component_async(
+                    component_name="tool_invoker",
+                    component={"instance": self._tool_invoker},
+                    component_inputs={"messages": llm_messages, "state": state},
+                    component_visits=component_visits,
+                    max_runs_per_component=self.max_agent_steps,
+                    parent_span=span,
+                )
+                tool_messages = tool_invoker_result["tool_messages"]
+                state = tool_invoker_result["state"]
+                state.set("messages", tool_messages)
+
+                # 4. Check if any LLM message's tool call name matches an exit condition
+                if self.exit_conditions != ["text"] and self._check_exit_conditions(llm_messages, tool_messages):
+                    counter += 1
+                    break
+
+                # 5. Fetch the combined messages and send them back to the LLM
+                messages = state.get("messages")
+                counter += 1
+
+            if counter >= self.max_agent_steps:
+                logger.warning(
+                    "Agent reached maximum agent steps of {max_agent_steps}, stopping.",
+                    max_agent_steps=self.max_agent_steps,
+                )
+            span.set_content_tag("haystack.agent.output", state.data)
+            span.set_tag("haystack.agent.steps_taken", counter)
+        return state.data
+
+    def _check_exit_conditions(self, llm_messages: List[ChatMessage], tool_messages: List[ChatMessage]) -> bool:
+        """
+        Check if any of the LLM messages' tool calls match an exit condition and if there are no errors.
+
+        :param llm_messages: List of messages from the LLM
+        :param tool_messages: List of messages from the tool invoker
+        :return: True if an exit condition is met and there are no errors, False otherwise
+        """
+        matched_exit_conditions = set()
+        has_errors = False
+
+        for msg in llm_messages:
+            if msg.tool_call and msg.tool_call.tool_name in self.exit_conditions:
+                matched_exit_conditions.add(msg.tool_call.tool_name)
+
+                # Check if any error is specifically from the tool matching the exit condition
+                tool_errors = [
+                    tool_msg.tool_call_result.error
+                    for tool_msg in tool_messages
+                    if tool_msg.tool_call_result is not None
+                    and tool_msg.tool_call_result.origin.tool_name == msg.tool_call.tool_name
+                ]
+                if any(tool_errors):
+                    has_errors = True
+                    # No need to check further if we found an error
+                    break
+
+        # Only return True if at least one exit condition was matched AND none had errors
+        return bool(matched_exit_conditions) and not has_errors
+
+
 
 class PipelineWrapper(BasePipelineWrapper):
     # Set name attribute to match expected model in requests
@@ -22,6 +443,8 @@ class PipelineWrapper(BasePipelineWrapper):
         # Create the web search component
         logger.info("Setting up web search component...")
         web_search = SerperDevWebSearch(top_k=3)
+
+        # TODO: add some more tools for a better demo...
 
         # Create the ComponentTool with simpler parameters
         logger.info("Creating web search tool...")
@@ -40,24 +463,11 @@ class PipelineWrapper(BasePipelineWrapper):
 Your primary goal is to answer the user's question.
 You have a tool called 'web_search' that can search the web for current information. Its description is: "Search the web for current information like weather, news, or facts."
 
-When you decide to use the 'web_search' tool:
-1. First, output an XML tag like this, containing the exact query you will use for the search: <tool_call name="web_search"><input>YOUR_SEARCH_QUERY</input></tool_call>
-2. Then, make the actual call to the 'web_search' tool. (This happens automatically when you signal the tool call to the system).
+When you need current information about the weather, news, facts, or other real-time data, use the 'web_search' tool to find accurate information.
 
-After the 'web_search' tool has been executed and you receive its results from the system:
-1. First, output an XML tag like this, summarizing or stating the raw output from the tool: <tool_result name="web_search"><output>TOOL_OUTPUT_SUMMARY_OR_DATA</output></tool_result>
-2. Then, use this information to formulate your final answer to the user.
+After receiving search results, extract the relevant information and present it to the user in a clear, concise manner.
 
-Example interaction if you need to search:
-User: What's the weather in Paris?
-Assistant: <tool_call name="web_search"><input>weather in Paris</input></tool_call>
-(System executes web_search tool with "weather in Paris" and provides you the results, e.g., "Paris is sunny, 25°C")
-Assistant: <tool_result name="web_search"><output>Paris is sunny, 25°C</output></tool_result>
-The weather in Paris is sunny and 25°C.
-
-If you don't need to use a tool, just answer directly.
-When asked about current information (like weather, news, or general facts), you should use the 'web_search' tool.
-After receiving search results, extract the relevant information and present it to the user in a clear, concise manner, following the XML formatting instructions above.""",
+If you don't need to use a tool, just answer directly.""",
             tools=[web_tool]
         )
 
